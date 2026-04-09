@@ -1,8 +1,11 @@
 {
     "layers": [
-        "5882819385ad487c6fe343b477e5deb01b89db5f2021d9354c7e2b02b7f50c02"
+        "4fe251df990906502cefacbb8bc8e1c037bac8cbba6bdf24f1963572c29d0b0a",
+        "969523d343ae0ebdf7de2d83adb5224febe8b694112a542dd7b9c14b0986b9e7"
     ],
-    "cmd": "python3, script.py",
-    "env": {},
+    "cmd": "sh, script.sh",
+    "env": {
+        "NAME": "Default"
+    },
     "workdir": "/app"
 }

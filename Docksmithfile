@@ -1,4 +1,11 @@
 FROM alpine
+
 WORKDIR /app
-COPY script.py .
-CMD ["python3", "script.py"]
+
+COPY script.sh .
+
+ENV NAME=Default
+
+RUN chmod +x script.sh
+
+CMD ["sh", "script.sh"]
