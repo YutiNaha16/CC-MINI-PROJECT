@@ -1,18 +1,28 @@
 {
-    "name": "docksmith",
-    "tag": "latest",
-    "digest": "39bc93c595cc06eb4ae87bcccebbeb3256559df43ab46559ade35783663ce78e",
-    "layers": [
-        "a19ace14da1df9e3d316412bc74c29bafda8b2b7220bd2014dcd93a04652fe62",
-        "7182dd5fc47164a6b04d7a29b31ddde82c4a89ddf04be1170acb96e1772865d5",
-        "fa42647f9214257d909ed28b3a1d8f817aa280248f400eaa65aa101a5acc4350"
+  "name": "docksmith",
+  "tag": "latest",
+  "digest": "sha256:126653d2f2bc4948b9a73414c4588cd3460b02650f21115a179cfe13f26667d4",
+  "created": "2026-04-14T14:48:56Z",
+  "config": {
+    "Env": [
+      "NAME=Default"
     ],
-    "cmd": [
-        "sh",
-        "/script.sh"
+    "Cmd": [
+      "sh",
+      "script.sh"
     ],
-    "env": {
-        "NAME": "Default"
+    "WorkingDir": "/app"
+  },
+  "layers": [
+    {
+      "digest": "12f1d9189a1524c9ab79885cafe6a4def297bbf4ffbba0e5a21f36c279978e0a",
+      "size": 8622080,
+      "createdBy": "COPY script.sh ."
     },
-    "workdir": "/app"
+    {
+      "digest": "12f1d9189a1524c9ab79885cafe6a4def297bbf4ffbba0e5a21f36c279978e0a",
+      "size": 8622080,
+      "createdBy": "RUN chmod +x script.sh"
+    }
+  ]
 }

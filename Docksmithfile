@@ -8,4 +8,4 @@ ENV NAME=Default
 
 RUN chmod +x script.sh
 
-CMD ["sh", "/script.sh"]
+CMD ["sh", "script.sh"]
