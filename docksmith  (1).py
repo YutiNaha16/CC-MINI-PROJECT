@@ -12,11 +12,35 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 CURRENT_WORKDIR = "/"
 CURRENT_ENV = {}
 
+
 # -------- CACHE KEY --------
-def compute_cache_key(prev_hash, instruction):
-    env_string = "".join([f"{k}={v}" for k, v in sorted(CURRENT_ENV.items())])
-    data = (prev_hash + instruction + CURRENT_WORKDIR + env_string).encode()
+def compute_cache_key(prev_hash, instruction, extra_file_hashes=None):
+    """
+    Cache key includes ALL of:
+      1. Previous layer digest (prev_hash)
+      2. Full instruction text as written
+      3. Current WORKDIR value at instruction time
+      4. Current ENV state — all key=value pairs sorted lexicographically by key
+      5. COPY only: SHA-256 of each source file's raw bytes, sorted by file path
+    """
+    env_string = "".join(
+        [f"{k}={v}" for k, v in sorted(CURRENT_ENV.items())]
+    )
+    file_hash_string = ""
+    if extra_file_hashes:
+        # Sort by file path for determinism
+        for path in sorted(extra_file_hashes.keys()):
+            file_hash_string += f"{path}:{extra_file_hashes[path]}"
+
+    data = (
+        prev_hash
+        + instruction
+        + CURRENT_WORKDIR
+        + env_string
+        + file_hash_string
+    ).encode()
     return hashlib.sha256(data).hexdigest()
+
 
 # -------- PARSE FILE --------
 def parse_docksmithfile():
@@ -32,22 +56,62 @@ def parse_docksmithfile():
             instructions.append((cmd, args, lineno))
     return instructions
 
-# -------- HASH --------
+
+# -------- HASH FILE --------
 def sha256_file(path):
     h = hashlib.sha256()
-    with open(path, 'rb') as f:
+    with open(path, "rb") as f:
         h.update(f.read())
     return h.hexdigest()
 
-# -------- CREATE LAYER --------
+
+# -------- REPRODUCIBLE LAYER --------
 def create_layer(src):
+    """
+    Create a deterministic tar layer from src directory.
+    - Entries added in lexicographically sorted path order
+    - All file timestamps zeroed to Unix epoch 0
+    Both are required for the same source to always produce the same digest.
+    """
     tar_name = "layer.tar"
+
     with tarfile.open(tar_name, "w") as tar:
-        tar.add(src, arcname=".")
+        # Collect all paths under src, sort lexicographically
+        all_paths = []
+        for root, dirs, files in os.walk(src):
+            dirs.sort()   # ensure os.walk descends in sorted order
+            for name in sorted(files):
+                all_paths.append(os.path.join(root, name))
+            for name in sorted(dirs):
+                all_paths.append(os.path.join(root, name))
+
+        all_paths.sort()  # final sort of absolute paths
+
+        seen = set()
+        for full_path in all_paths:
+            arcname = os.path.relpath(full_path, src)
+            if arcname in seen:
+                continue
+            seen.add(arcname)
+
+            info = tar.gettarinfo(full_path, arcname=arcname)
+            # Zero all timestamps for reproducibility
+            
+            info = tar.gettarinfo(full_path, arcname=arcname)
+            info.mtime = 0
+
+
+            if info.isreg():
+                with open(full_path, "rb") as f:
+                    tar.addfile(info, f)
+            else:
+                tar.addfile(info)
+
     digest = sha256_file(tar_name)
     final = os.path.join(LAYER_DIR, f"{digest}.tar")
     shutil.move(tar_name, final)
     return digest
+
 
 # -------- GET BASE --------
 def get_base():
@@ -56,9 +120,9 @@ def get_base():
             return os.path.join(BASE_IMAGE_DIR, file)
     raise Exception("Base image missing")
 
+
 # -------- APPLY LAYERS --------
 def apply_layers(root, layer_list=None):
-    # If a specific list is passed, use it; otherwise read from image_layers.txt
     if layer_list is not None:
         layers = layer_list
     elif os.path.exists("image_layers.txt"):
@@ -70,49 +134,46 @@ def apply_layers(root, layer_list=None):
     for l in layers:
         layer_path = os.path.join(LAYER_DIR, l + ".tar")
         if os.path.exists(layer_path):
-            subprocess.run(["tar", "-xf", layer_path, "-C", root],
-                           stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["tar", "-xf", layer_path, "-C", root],
+                stderr=subprocess.DEVNULL,
+            )
         else:
             print(f"[WARN] Missing layer skipped: {l}")
 
+
 # -------- PARSE -e FLAGS --------
 def parse_env_flags(argv):
-    """
-    Parse -e KEY=VALUE flags from argv list.
-    Supports: -e KEY=VALUE  (as separate token or attached)
-    Returns a dict of overrides.
-    """
     overrides = {}
     i = 0
     while i < len(argv):
         arg = argv[i]
         if arg == "-e":
-            # Next token is KEY=VALUE
             if i + 1 < len(argv):
                 kv = argv[i + 1]
                 if "=" in kv:
                     key, value = kv.split("=", 1)
                     overrides[key.strip()] = value.strip()
                 else:
-                    print(f"Error: -e flag must be in KEY=VALUE format, got: {kv}")
+                    print(f"Error: -e flag must be KEY=VALUE, got: {kv}")
                     sys.exit(1)
                 i += 2
             else:
                 print("Error: -e flag requires KEY=VALUE argument")
                 sys.exit(1)
         elif arg.startswith("-e") and len(arg) > 2:
-            # Attached form: -eKEY=VALUE
             kv = arg[2:]
             if "=" in kv:
                 key, value = kv.split("=", 1)
                 overrides[key.strip()] = value.strip()
             else:
-                print(f"Error: -e flag must be in KEY=VALUE format, got: {kv}")
+                print(f"Error: -e flag must be KEY=VALUE, got: {kv}")
                 sys.exit(1)
             i += 1
         else:
             i += 1
     return overrides
+
 
 # -------- BUILD --------
 def build(no_cache=False):
@@ -121,17 +182,19 @@ def build(no_cache=False):
     instr = parse_docksmithfile()
     layers = []
     prev_hash = ""
-    cmd_instruction = None   # None means CMD was never set
+    cmd_instruction = None
     cmd_lineno = None
 
     CURRENT_WORKDIR = "/"
     CURRENT_ENV = {}
 
+    # ---- Cache cascade flag ----
+    # Once any layer-producing step is a cache miss, ALL subsequent steps
+    # must also miss regardless of their own cache key.
+    force_miss = False
+
     for cmd, args, lineno in instr:
         instruction_text = cmd + " " + args
-
-        cache_key = compute_cache_key(prev_hash, instruction_text)
-        cache_file = os.path.join(CACHE_DIR, cache_key)
 
         # -------- FROM --------
         if cmd == "FROM":
@@ -140,7 +203,11 @@ def build(no_cache=False):
 
         # -------- WORKDIR --------
         elif cmd == "WORKDIR":
-            if (not no_cache) and os.path.exists(cache_file):
+            # Compute key BEFORE updating WORKDIR
+            cache_key = compute_cache_key(prev_hash, instruction_text)
+            cache_file = os.path.join(CACHE_DIR, cache_key)
+
+            if (not no_cache) and (not force_miss) and os.path.exists(cache_file):
                 print("[CACHE HIT]", instruction_text)
                 with open(cache_file) as f:
                     layer_hash = f.read().strip()
@@ -150,22 +217,34 @@ def build(no_cache=False):
                 continue
 
             print("[CACHE MISS]", instruction_text)
+            force_miss = True   # cascade: all subsequent steps must miss
 
             temp_root = tempfile.mkdtemp(dir="/tmp")
-            subprocess.run(["tar", "-xzf", get_base(), "-C", temp_root],
-                           stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["tar", "-xzf", get_base(), "-C", temp_root],
+                stderr=subprocess.DEVNULL,
+            )
             apply_layers(temp_root, layers)
 
             CURRENT_WORKDIR = args
-            os.makedirs(os.path.join(temp_root, CURRENT_WORKDIR.lstrip("/")), exist_ok=True)
+            os.makedirs(
+                os.path.join(temp_root, CURRENT_WORKDIR.lstrip("/")),
+                exist_ok=True,
+            )
 
             layer_hash = create_layer(temp_root)
             shutil.rmtree(temp_root, ignore_errors=True)
 
+            with open(cache_file, "w") as f:
+                f.write(layer_hash)
+
+            layers.append(layer_hash)
+            prev_hash = layer_hash
+
         # -------- ENV --------
         elif cmd == "ENV":
             if "=" not in args:
-                print(f"Error: ENV must be in KEY=VALUE format at line {lineno}")
+                print(f"Error: ENV must be KEY=VALUE at line {lineno}")
                 sys.exit(1)
             key, value = args.split("=", 1)
             CURRENT_ENV[key.strip()] = value.strip()
@@ -174,26 +253,48 @@ def build(no_cache=False):
 
         # -------- CMD --------
         elif cmd == "CMD":
-            # CMD MUST be a JSON array — ["exec", "arg"] form only
             try:
                 parsed = json.loads(args)
                 if not isinstance(parsed, list):
                     raise ValueError("CMD must be a JSON array")
-                # Validate all elements are strings
                 for item in parsed:
                     if not isinstance(item, str):
-                        raise ValueError("CMD array elements must be strings")
-                cmd_instruction = parsed          # store as list
+                        raise ValueError("CMD elements must be strings")
+                cmd_instruction = parsed
                 cmd_lineno = lineno
             except (json.JSONDecodeError, ValueError) as e:
-                print(f"Error on line {lineno}: CMD must be a JSON array like [\"exec\", \"arg\"] — got: {args}")
+                print(
+                    f"Error on line {lineno}: CMD must be a JSON array like "
+                    f'["exec", "arg"] — got: {args}'
+                )
                 sys.exit(1)
             print("[CMD SET]", cmd_instruction)
             continue
 
         # -------- COPY --------
         elif cmd == "COPY":
-            if (not no_cache) and os.path.exists(cache_file):
+            parts = args.split()
+            if len(parts) != 2:
+                print(f"Error on line {lineno}: COPY requires exactly <src> <dest>")
+                sys.exit(1)
+            src, dest = parts
+
+            # Hash source file(s) for cache key — sorted by path
+            extra_file_hashes = {}
+            if os.path.isfile(src):
+                extra_file_hashes[src] = sha256_file(src)
+            elif os.path.isdir(src):
+                for root_dir, _, files in os.walk(src):
+                    for fname in files:
+                        fpath = os.path.join(root_dir, fname)
+                        extra_file_hashes[fpath] = sha256_file(fpath)
+
+            cache_key = compute_cache_key(
+                prev_hash, instruction_text, extra_file_hashes
+            )
+            cache_file = os.path.join(CACHE_DIR, cache_key)
+
+            if (not no_cache) and (not force_miss) and os.path.exists(cache_file):
                 print("[CACHE HIT]", instruction_text)
                 with open(cache_file) as f:
                     layer_hash = f.read().strip()
@@ -202,16 +303,13 @@ def build(no_cache=False):
                 continue
 
             print("[CACHE MISS]", instruction_text)
-
-            parts = args.split()
-            if len(parts) != 2:
-                print(f"Error on line {lineno}: COPY requires exactly <src> <dest>")
-                sys.exit(1)
-            src, dest = parts
+            force_miss = True   # cascade
 
             temp_root = tempfile.mkdtemp(dir="/tmp")
-            subprocess.run(["tar", "-xzf", get_base(), "-C", temp_root],
-                           stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["tar", "-xzf", get_base(), "-C", temp_root],
+                stderr=subprocess.DEVNULL,
+            )
             apply_layers(temp_root, layers)
 
             full_dest = os.path.join(temp_root, dest.lstrip("/"))
@@ -221,9 +319,18 @@ def build(no_cache=False):
             layer_hash = create_layer(temp_root)
             shutil.rmtree(temp_root, ignore_errors=True)
 
+            with open(cache_file, "w") as f:
+                f.write(layer_hash)
+
+            layers.append(layer_hash)
+            prev_hash = layer_hash
+
         # -------- RUN --------
         elif cmd == "RUN":
-            if (not no_cache) and os.path.exists(cache_file):
+            cache_key = compute_cache_key(prev_hash, instruction_text)
+            cache_file = os.path.join(CACHE_DIR, cache_key)
+
+            if (not no_cache) and (not force_miss) and os.path.exists(cache_file):
                 print("[CACHE HIT]", instruction_text)
                 with open(cache_file) as f:
                     layer_hash = f.read().strip()
@@ -232,21 +339,27 @@ def build(no_cache=False):
                 continue
 
             print("[CACHE MISS]", instruction_text)
+            force_miss = True   # cascade
 
             temp_root = tempfile.mkdtemp(dir="/tmp")
-            subprocess.run(["tar", "-xzf", get_base(), "-C", temp_root],
-                           stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["tar", "-xzf", get_base(), "-C", temp_root],
+                stderr=subprocess.DEVNULL,
+            )
             apply_layers(temp_root, layers)
 
-            os.makedirs(os.path.join(temp_root, CURRENT_WORKDIR.lstrip("/")), exist_ok=True)
+            os.makedirs(
+                os.path.join(temp_root, CURRENT_WORKDIR.lstrip("/")),
+                exist_ok=True,
+            )
 
-            # Build env string for shell
-            env_prefix = " ".join([f"{k}={json.dumps(v)}" for k, v in CURRENT_ENV.items()])
+            env_prefix = " ".join(
+                [f"{k}={json.dumps(v)}" for k, v in CURRENT_ENV.items()]
+            )
             shell_cmd = f"cd {CURRENT_WORKDIR} && {args}"
             if env_prefix:
                 shell_cmd = f"export {env_prefix} && {shell_cmd}"
 
-            # Use same chroot isolation primitive as runtime run()
             result = subprocess.run(
                 ["chroot", temp_root, "/bin/sh", "-c", shell_cmd]
             )
@@ -254,22 +367,21 @@ def build(no_cache=False):
             layer_hash = create_layer(temp_root)
             shutil.rmtree(temp_root, ignore_errors=True)
 
+            with open(cache_file, "w") as f:
+                f.write(layer_hash)
+
+            layers.append(layer_hash)
+            prev_hash = layer_hash
+
         else:
             print(f"[WARN] Unknown instruction '{cmd}' at line {lineno}, skipping")
             continue
-
-        with open(cache_file, "w") as f:
-            f.write(layer_hash)
-
-        layers.append(layer_hash)
-        prev_hash = layer_hash
 
     # -------- SAVE --------
     with open("image_layers.txt", "w") as f:
         for l in layers:
             f.write(l + "\n")
 
-    # Compute image digest from all layer hashes combined
     combined = "".join(layers).encode()
     image_digest = hashlib.sha256(combined).hexdigest()
 
@@ -278,15 +390,16 @@ def build(no_cache=False):
         "tag": "latest",
         "digest": image_digest,
         "layers": layers,
-        "cmd": cmd_instruction,   # stored as list or None
+        "cmd": cmd_instruction,
         "env": CURRENT_ENV,
-        "workdir": CURRENT_WORKDIR
+        "workdir": CURRENT_WORKDIR,
     }
 
     with open("manifest.json", "w") as f:
         json.dump(manifest, f, indent=4)
 
     print("[✓] Build complete")
+
 
 # -------- RUN CONTAINER --------
 def run():
@@ -297,35 +410,25 @@ def run():
     with open("manifest.json") as f:
         manifest = json.load(f)
 
-    # Resolve CMD: image CMD can be overridden by trailing args after 'run'
-    # argv looks like: docksmith.py run [-e K=V ...] [cmd arg ...]
-    run_argv = sys.argv[2:]   # everything after 'run'
+    run_argv = sys.argv[2:]
 
-    # Split out -e flags and positional args
-    positional = [a for a in run_argv if not a.startswith("-e") and
-                  not (run_argv[max(0, run_argv.index(a)-1):run_argv.index(a)] == ["-e"])]
-
-    # Safer: walk and collect
     env_overrides = parse_env_flags(run_argv)
     positional_cmd = []
     i = 0
     while i < len(run_argv):
         if run_argv[i] == "-e":
-            i += 2   # skip flag and its value
+            i += 2
         elif run_argv[i].startswith("-e") and len(run_argv[i]) > 2:
-            i += 1   # skip attached -eKEY=VALUE
+            i += 1
         else:
             positional_cmd.append(run_argv[i])
             i += 1
 
-    # Determine final command to run
     if positional_cmd:
-        # Runtime override: treat positional args as the command list
         final_cmd_list = positional_cmd
     else:
-        final_cmd_list = manifest.get("cmd")   # list or None
+        final_cmd_list = manifest.get("cmd")
 
-    # Fail clearly if no CMD anywhere
     if not final_cmd_list:
         print("Error: No CMD defined in image and no command provided at runtime.")
         print("Usage: python3 docksmith.py run [cmd args...]")
@@ -333,41 +436,38 @@ def run():
 
     workdir = manifest.get("workdir", "/")
 
-    # Build env: start from manifest ENV, then apply -e overrides
     env = {}
     env.update(manifest.get("env", {}))
     env.update(env_overrides)
 
-    # Create container filesystem
     root = tempfile.mkdtemp(dir="/tmp")
     print("[*] Temp:", root)
 
-    subprocess.run(["tar", "-xzf", get_base(), "-C", root],
-                   stderr=subprocess.DEVNULL)
+    subprocess.run(
+        ["tar", "-xzf", get_base(), "-C", root], stderr=subprocess.DEVNULL
+    )
     apply_layers(root, manifest.get("layers", []))
 
     os.makedirs(os.path.join(root, workdir.lstrip("/")), exist_ok=True)
 
     print("[*] Inside container")
 
-    # Build the full environment for the subprocess
-    # We pass env vars as exports inside the shell command so they work post-chroot
-    env_exports = " && ".join([f"export {k}={json.dumps(v)}" for k, v in env.items()])
+    env_exports = " && ".join(
+        [f"export {k}={json.dumps(v)}" for k, v in env.items()]
+    )
     cmd_str = " ".join(final_cmd_list)
     if env_exports:
         shell_cmd = f"{env_exports} && cd {workdir} && {cmd_str}"
     else:
         shell_cmd = f"cd {workdir} && {cmd_str}"
 
-    # chroot isolation — same primitive as build's RUN
     result = subprocess.run(
         ["chroot", root, "/bin/sh", "-c", shell_cmd]
     )
 
     print(f"[*] Exit code: {result.returncode}")
-
-    # Cleanup
     shutil.rmtree(root, ignore_errors=True)
+
 
 # -------- IMAGES --------
 def images():
@@ -378,14 +478,14 @@ def images():
     with open("manifest.json") as f:
         manifest = json.load(f)
 
-    name    = manifest.get("name", "docksmith")
-    tag     = manifest.get("tag", "latest")
-    digest  = manifest.get("digest", "")
+    name = manifest.get("name", "docksmith")
+    tag = manifest.get("tag", "latest")
+    digest = manifest.get("digest", "")
     image_id = digest[:12] if digest else "unknown"
 
-    # Header
     print(f"{'NAME':<20} {'TAG':<15} {'IMAGE ID':<15}")
     print(f"{name:<20} {tag:<15} {image_id:<15}")
+
 
 # -------- RMI --------
 def rmi():
@@ -409,6 +509,7 @@ def rmi():
 
     print(f"Image removed. ({removed} layer(s) deleted)")
 
+
 # -------- CLI --------
 def main():
     if len(sys.argv) < 2:
@@ -425,19 +526,16 @@ def main():
     if command == "build":
         no_cache = "--no-cache" in sys.argv
         build(no_cache=no_cache)
-
     elif command == "run":
         run()
-
     elif command == "images":
         images()
-
     elif command == "rmi":
         rmi()
-
     else:
         print(f"Unknown command: '{command}'")
         print("Use: build | run | images | rmi")
+
 
 if __name__ == "__main__":
     main()
