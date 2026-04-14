@@ -175,6 +175,27 @@ def parse_env_flags(argv):
     return overrides
 
 
+def normalize_runtime_cmd(cmd_list, root, workdir):
+    if not isinstance(cmd_list, list) or len(cmd_list) < 2:
+        return cmd_list
+
+    target = cmd_list[1]
+    if not isinstance(target, str) or not target.startswith("/"):
+        return cmd_list
+
+    absolute_path = os.path.join(root, target.lstrip("/"))
+    if os.path.exists(absolute_path):
+        return cmd_list
+
+    candidate = os.path.join(root, workdir.lstrip("/"), os.path.basename(target))
+    if os.path.exists(candidate):
+        updated = list(cmd_list)
+        updated[1] = os.path.basename(target)
+        return updated
+
+    return cmd_list
+
+
 # -------- BUILD --------
 def build(no_cache=False):
     global CURRENT_WORKDIR, CURRENT_ENV
@@ -312,7 +333,13 @@ def build(no_cache=False):
             )
             apply_layers(temp_root, layers)
 
-            full_dest = os.path.join(temp_root, dest.lstrip("/"))
+            # COPY destination is relative to WORKDIR when destination is not absolute.
+            if dest.startswith("/"):
+                resolved_dest = dest
+            else:
+                resolved_dest = os.path.join(CURRENT_WORKDIR, dest)
+
+            full_dest = os.path.join(temp_root, resolved_dest.lstrip("/"))
             os.makedirs(os.path.dirname(full_dest) or temp_root, exist_ok=True)
             shutil.copy(src, full_dest)
 
@@ -452,6 +479,8 @@ def run():
 
     print("[*] Inside container")
 
+    final_cmd_list = normalize_runtime_cmd(final_cmd_list, root, workdir)
+
     env_exports = " && ".join(
         [f"export {k}={json.dumps(v)}" for k, v in env.items()]
     )
@@ -497,8 +526,13 @@ def rmi():
         manifest = json.load(f)
 
     removed = 0
-    for l in manifest.get("layers", []):
-        path = os.path.join(LAYER_DIR, l + ".tar")
+    for layer in manifest.get("layers", []):
+        if isinstance(layer, dict):
+            digest = str(layer.get("digest", "")).replace("sha256:", "")
+        else:
+            digest = str(layer)
+
+        path = os.path.join(LAYER_DIR, digest + ".tar")
         if os.path.exists(path):
             os.remove(path)
             removed += 1
